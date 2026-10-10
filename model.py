@@ -170,7 +170,9 @@ class ChoiceModel(nn.Module):
         causal = torch.ones(
             total_len, total_len, dtype=torch.bool, device=device
         ).tril()
-        allowed = (causal | is_choice[None, :])[None] & key_valid[:, None, :]
+        diagonal = torch.eye(total_len, dtype=torch.bool, device=device)
+        prompt_keys = (causal & ~is_choice[None, :])[None] & key_valid[:, None, :]
+        allowed = prompt_keys | diagonal
         dtype = inputs_embeds.dtype
         full_attention_mask = torch.zeros(allowed.shape, dtype=dtype, device=device)
         full_attention_mask = full_attention_mask.masked_fill(

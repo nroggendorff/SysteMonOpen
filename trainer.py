@@ -23,9 +23,11 @@ class Trainer:
         self.log_every = log_every
         if gradient_checkpointing:
             self.model.qwen.gradient_checkpointing_enable()
-        self.optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=lr
-        )
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.master_params = [
+            p if p.dtype == torch.float32 else p.detach().float() for p in self.params
+        ]
+        self.optimizer = torch.optim.AdamW(self.master_params, lr=lr, fused=True)
 
     def train(self, dataset: Dataset, epochs: int = 1, seed: int = 0):
         self.model.train()
@@ -50,11 +52,18 @@ class Trainer:
                 losses.append(loss.item())
 
                 if (i + 1) % self.grad_accum_steps == 0 or i + 1 == len(shuffled):
+                    for p, master in zip(self.params, self.master_params):
+                        if master is not p and p.grad is not None:
+                            master.grad, p.grad = p.grad.float(), None
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
+                        self.master_params, self.max_grad_norm
                     )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    with torch.no_grad():
+                        for p, master in zip(self.params, self.master_params):
+                            if master is not p:
+                                p.copy_(master)
                     step += 1
                     if step % self.log_every == 0:
                         print(
