@@ -1,23 +1,14 @@
-from bisect import bisect_right
-
 from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer
 
 from config import Config
 
 config = Config()
-tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
 
-def format_prompt(
-    state: str, question: str, options: list[str]
-) -> tuple[str, list[int]]:
-    text = "\n".join([state.strip(), "", question.strip(), "", "Options:"])
-    option_ends = []
-    for i, option in enumerate(options):
-        text += f"\n{i + 1}. {option}"
-        option_ends.append(len(text))
-    return text, option_ends
+def format_prompt(state: str, question: str, options: list[str]) -> str:
+    lines = [state.strip(), "", question.strip(), "", "Options:"]
+    lines += [f"{i + 1}. {option}" for i, option in enumerate(options)]
+    return "\n".join(lines)
 
 
 def load_choice_dataset(split: str = "train", num_proc: int | None = None) -> Dataset:
@@ -30,17 +21,12 @@ def load_choice_dataset(split: str = "train", num_proc: int | None = None) -> Da
         return min(target) >= 0 and sum(target) > 0
 
     def convert(example) -> dict:
-        text, option_ends = format_prompt(
-            example["state"], example["question"], example["options"]
-        )
-        encoding = tokenizer(text, return_offsets_mapping=True)
-        token_starts = [start for start, _ in encoding.offset_mapping]
         total = sum(example["target"])
         return {
-            "input_ids": encoding.input_ids,
-            "choice_positions": [
-                bisect_right(token_starts, end - 1) - 1 for end in option_ends
-            ],
+            "text": format_prompt(
+                example["state"], example["question"], example["options"]
+            ),
+            "num_choices": len(example["options"]),
             "target": [p / total for p in example["target"]],
         }
 

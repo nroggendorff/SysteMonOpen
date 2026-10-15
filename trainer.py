@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
@@ -11,69 +9,64 @@ class Trainer:
     def __init__(
         self,
         model: ChoiceModel,
-        lr: float = 1e-4,
+        lr: float = 1e-5,
         grad_accum_steps: int = 16,
+        max_grad_norm: float = 1.0,
+        gradient_checkpointing: bool = True,
         log_every: int = 10,
         device: str = "cuda",
     ):
         self.model = model.to(device)
         self.device = device
         self.grad_accum_steps = grad_accum_steps
+        self.max_grad_norm = max_grad_norm
         self.log_every = log_every
-        self.optimizer = torch.optim.AdamW([model.axes], lr=lr, fused=True)
-
-    def score(self, example) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids = torch.tensor([example["input_ids"]], device=self.device)
-        choice_positions = torch.tensor(
-            [example["choice_positions"]], device=self.device
-        )
-        scores = self.model(input_ids, choice_positions)[:, 0]
-        target = torch.tensor(example["target"], device=self.device)
-        loss = F.cross_entropy(scores, target.expand_as(scores), reduction="none")
-        top1 = target[scores.argmax(-1)]
-        return loss, top1
+        if gradient_checkpointing:
+            self.model.qwen.gradient_checkpointing_enable()
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.master_params = [
+            p if p.dtype == torch.float32 else p.detach().float() for p in self.params
+        ]
+        self.optimizer = torch.optim.AdamW(self.master_params, lr=lr, fused=True)
 
     def train(self, dataset: Dataset, epochs: int = 1, seed: int = 0):
+        self.model.train()
         self.optimizer.zero_grad()
         step = 0
-        losses, top1s, uniform = [], [], []
+        losses = []
         for epoch in range(epochs):
             shuffled = dataset.shuffle(seed=seed + epoch)
 
             for i, example in enumerate(shuffled):
-                loss, top1 = self.score(example)
-                (loss.sum() / self.grad_accum_steps).backward()
-                losses.append(loss.detach())
-                top1s.append(top1)
-                uniform.append(math.log(len(example["target"])))
+                input_ids = self.model.tokenizer(
+                    example["text"], return_tensors="pt"
+                ).input_ids.to(self.device)
+                scores = torch.stack(
+                    self.model(input_ids, example["num_choices"]), dim=-1
+                )
+                target = torch.tensor(
+                    [example["target"]], dtype=scores.dtype, device=self.device
+                )
+                loss = F.cross_entropy(scores, target)
+                (loss / self.grad_accum_steps).backward()
+                losses.append(loss.item())
 
                 if (i + 1) % self.grad_accum_steps == 0 or i + 1 == len(shuffled):
+                    for p, master in zip(self.params, self.master_params):
+                        if master is not p and p.grad is not None:
+                            master.grad, p.grad = p.grad.float(), None
+                    torch.nn.utils.clip_grad_norm_(
+                        self.master_params, self.max_grad_norm
+                    )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    with torch.no_grad():
+                        for p, master in zip(self.params, self.master_params):
+                            if master is not p:
+                                p.copy_(master)
                     step += 1
                     if step % self.log_every == 0:
-                        mean_loss = torch.stack(losses).mean(0)
-                        mean_top1 = torch.stack(top1s).mean(0)
-                        layer = mean_loss.argmin().item()
                         print(
-                            f"epoch {epoch} step {step} uniform {sum(uniform) / len(uniform):.4f} "
-                            f"best layer {layer} loss {mean_loss[layer]:.4f} top1 {mean_top1[layer]:.3f}"
+                            f"epoch {epoch} step {step} loss {sum(losses) / len(losses):.4f}"
                         )
                         losses.clear()
-                        top1s.clear()
-                        uniform.clear()
-
-    @torch.no_grad()
-    def evaluate(self, dataset: Dataset) -> dict:
-        losses, top1s, num_choices = [], [], []
-        for example in dataset:
-            loss, top1 = self.score(example)
-            losses.append(loss)
-            top1s.append(top1)
-            num_choices.append(len(example["target"]))
-        return {
-            "loss": torch.stack(losses).mean(0).cpu(),
-            "top1": torch.stack(top1s).mean(0).cpu(),
-            "uniform_loss": sum(map(math.log, num_choices)) / len(num_choices),
-            "uniform_top1": sum(1 / n for n in num_choices) / len(num_choices),
-        }
